@@ -28,7 +28,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 )
 
 var SingleNodeConsolidationTimeoutDuration = 3 * time.Minute
@@ -39,24 +38,24 @@ const SingleNodeConsolidationType = "single"
 type SingleNodeConsolidation struct {
 	consolidation
 	PreviouslyUnseenNodePools sets.Set[string]
+	Validator
 }
 
-func NewSingleNodeConsolidation(consolidation consolidation) *SingleNodeConsolidation {
+func NewSingleNodeConsolidation(c consolidation) *SingleNodeConsolidation {
 	return &SingleNodeConsolidation{
-		consolidation:             consolidation,
+		consolidation:             c,
 		PreviouslyUnseenNodePools: sets.New[string](),
+		Validator:                 NewSingleConsolidationValidator(c),
 	}
 }
 
 // ComputeCommand generates a disruption command given candidates
 // nolint:gocyclo
-func (s *SingleNodeConsolidation) ComputeCommand(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) (Command, scheduling.Results, error) {
+func (s *SingleNodeConsolidation) ComputeCommand(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) (Command, error) {
 	if s.IsConsolidated() {
-		return Command{}, scheduling.Results{}, nil
+		return Command{}, nil
 	}
 	candidates = s.SortCandidates(ctx, candidates)
-
-	v := NewValidation(s.clock, s.cluster, s.kubeClient, s.provisioner, s.cloudProvider, s.recorder, s.queue, s.Reason())
 
 	// Set a timeout
 	timeout := s.clock.Now().Add(SingleNodeConsolidationTimeoutDuration)
@@ -66,12 +65,12 @@ func (s *SingleNodeConsolidation) ComputeCommand(ctx context.Context, disruption
 
 	for i, candidate := range candidates {
 		if s.clock.Now().After(timeout) {
-			ConsolidationTimeoutsTotal.Inc(map[string]string{consolidationTypeLabel: s.ConsolidationType()})
+			ConsolidationTimeoutsTotal.Inc(map[string]string{ConsolidationTypeLabel: s.ConsolidationType()})
 			log.FromContext(ctx).V(1).Info(fmt.Sprintf("abandoning single-node consolidation due to timeout after evaluating %d candidates", i))
 
 			s.PreviouslyUnseenNodePools = unseenNodePools
 
-			return Command{}, scheduling.Results{}, nil
+			return Command{}, nil
 		}
 		// Track that we've seen this nodepool
 		unseenNodePools.Delete(candidate.NodePool.Name)
@@ -91,7 +90,7 @@ func (s *SingleNodeConsolidation) ComputeCommand(ctx context.Context, disruption
 		}
 
 		// compute a possible consolidation option
-		cmd, results, err := s.computeConsolidation(ctx, candidate)
+		cmd, err := s.computeConsolidation(ctx, candidate)
 		if err != nil {
 			log.FromContext(ctx).Error(err, "failed computing consolidation")
 			continue
@@ -99,14 +98,14 @@ func (s *SingleNodeConsolidation) ComputeCommand(ctx context.Context, disruption
 		if cmd.Decision() == NoOpDecision {
 			continue
 		}
-		if err := v.IsValid(ctx, cmd, consolidationTTL); err != nil {
+		if _, err = s.Validate(ctx, cmd, consolidationTTL); err != nil {
 			if IsValidationError(err) {
 				log.FromContext(ctx).V(1).WithValues(cmd.LogValues()...).Info("abandoning single-node consolidation attempt due to pod churn, command is no longer valid")
-				return Command{}, scheduling.Results{}, nil
+				return Command{}, nil
 			}
-			return Command{}, scheduling.Results{}, fmt.Errorf("validating consolidation, %w", err)
+			return Command{}, fmt.Errorf("validating consolidation, %w", err)
 		}
-		return cmd, results, nil
+		return cmd, nil
 	}
 
 	if !constrainedByBudgets {
@@ -118,7 +117,7 @@ func (s *SingleNodeConsolidation) ComputeCommand(ctx context.Context, disruption
 
 	s.PreviouslyUnseenNodePools = unseenNodePools
 
-	return Command{}, scheduling.Results{}, nil
+	return Command{}, nil
 }
 
 func (s *SingleNodeConsolidation) Reason() v1.DisruptionReason {

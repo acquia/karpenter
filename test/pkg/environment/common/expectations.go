@@ -25,7 +25,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/awslabs/operatorpkg/status"
+	"github.com/awslabs/operatorpkg/object"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
@@ -115,29 +115,34 @@ func (env *Environment) ExpectStatusUpdated(objects ...client.Object) {
 	}
 }
 
-func (env *Environment) ExpectNodeClassCondition(nodeclass *unstructured.Unstructured, conditions []status.Condition) client.Object {
+func (env *Environment) ExpectReplaceNodeClassCondition(nodeclass *unstructured.Unstructured, condition metav1.Condition) *unstructured.Unstructured {
 	result := nodeclass.DeepCopy()
+	updateStatusCondition := []metav1.Condition{condition}
 
-	err := unstructured.SetNestedSlice(result.Object, lo.Map(conditions, func(condition status.Condition, _ int) interface{} {
+	tt, _, _ := unstructured.NestedSlice(result.Object, "status", "conditions")
+	for _, t := range tt {
+		cond := t.(map[string]interface{})
+		if cond["type"].(string) == condition.Type {
+			continue
+		}
+		updateStatusCondition = append(updateStatusCondition, metav1.Condition{
+			Type:               cond["type"].(string),
+			Status:             metav1.ConditionStatus(cond["status"].(string)),
+			LastTransitionTime: metav1.Unix(lo.Must(time.Parse(time.RFC3339, cond["lastTransitionTime"].(string))).Unix(), 0),
+			Reason:             cond["reason"].(string),
+			Message:            cond["message"].(string),
+			ObservedGeneration: cond["observedGeneration"].(int64),
+		})
+	}
+
+	err := unstructured.SetNestedSlice(result.Object, lo.Map(updateStatusCondition, func(condition metav1.Condition, _ int) interface{} {
 		b := map[string]interface{}{}
-		if condition.Type != "" {
-			b["type"] = condition.Type
-		}
-		if condition.Reason != "" {
-			b["reason"] = condition.Reason
-		}
-		if condition.Status != "" {
-			b["status"] = string(condition.Status)
-		}
-		if condition.Message != "" {
-			b["message"] = condition.Message
-		}
-		if !condition.LastTransitionTime.IsZero() {
-			b["lastTransitionTime"] = condition.LastTransitionTime.Format(time.RFC3339)
-		}
-		if condition.ObservedGeneration != 0 {
-			b["observedGeneration"] = condition.ObservedGeneration
-		}
+		b["type"] = condition.Type
+		b["reason"] = condition.Reason
+		b["status"] = string(condition.Status)
+		b["message"] = condition.Message
+		b["lastTransitionTime"] = condition.LastTransitionTime.Format(time.RFC3339)
+		b["observedGeneration"] = condition.ObservedGeneration
 		return b
 	}), "status", "conditions")
 	Expect(err).To(BeNil())
@@ -928,6 +933,94 @@ func (env *Environment) ExpectBlockNodeRegistration() {
 			Spec: corev1.NodeSpec{
 				ProviderID: "test-provider",
 			}}, client.DryRunAll)).ToNot(Succeed())
+	}).Should(Succeed())
+}
+
+// ExpectBlockNodeClassStatus sets up a nodeclass status update blocking mechanism using ValidatingAdmissionPolicy.
+// It creates a policy that prevents nodeclassess from updating their status
+//
+// The function performs the following steps:
+// 1. Verifies the cluster version is 1.28 or higher (requirement for ValidatingAdmissionPolicy)
+// 2. Creates an admission policy that specifically targets nodeclass status updates
+// 3. Creates a binding for the admission policy to enforce the validation
+//
+// Note: Requires Kubernetes version 1.28+ to function properly.
+func (env *Environment) ExpectBlockNodeClassStatus(nodeClass *unstructured.Unstructured) {
+	GinkgoHelper()
+
+	version, err := env.KubeClient.Discovery().ServerVersion()
+	Expect(err).To(BeNil())
+	if version.Minor < "28" {
+		Skip("This test is only valid for K8s >= 1.28")
+	}
+
+	// Define the ValidatingAdmissionPolicy that will inspect node creation requests
+	// The policy's validation expression checks if the 'registration' label equals 'fail'
+	admissionspolicy := &admissionregistrationv1.ValidatingAdmissionPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "admission-policy",
+			Labels: map[string]string{
+				test.DiscoveryLabel: "unspecified",
+			},
+		},
+		Spec: admissionregistrationv1.ValidatingAdmissionPolicySpec{
+			FailurePolicy: lo.ToPtr(admissionregistrationv1.Fail),
+			MatchConstraints: &admissionregistrationv1.MatchResources{
+				ResourceRules: []admissionregistrationv1.NamedRuleWithOperations{
+					{
+						RuleWithOperations: admissionregistrationv1.RuleWithOperations{
+							Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Update},
+							Rule: admissionregistrationv1.Rule{
+								APIGroups:   []string{object.GVK(nodeClass).Group},
+								APIVersions: []string{object.GVK(nodeClass).Version},
+								Resources:   []string{strings.ToLower(object.GVK(nodeClass).Kind) + "es/status"},
+							},
+						},
+					},
+				},
+			},
+			Validations: []admissionregistrationv1.Validation{
+				{
+					// Blocks status condition updates that lack the 'TestingNotReady' reason field.
+					// This prevents the Karpenter controller from modifying status conditions
+					// while allowing our test suite to make updates. This provides a deterministic
+					// mechanism for E2E tests to update NodeClass conditions.
+					Expression: "object.status.conditions.filter(c, c.type == 'Ready').all(c, c.reason == 'TestingNotReady')",
+				},
+			},
+		},
+	}
+
+	// Create the binding that connects the admission policy to the cluster's admission chain
+	admissionspolicybinding := &admissionregistrationv1.ValidatingAdmissionPolicyBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "admission-policy-binding",
+			Labels: map[string]string{
+				test.DiscoveryLabel: "unspecified",
+			},
+		},
+		Spec: admissionregistrationv1.ValidatingAdmissionPolicyBindingSpec{
+			PolicyName:        admissionspolicy.Name,
+			ValidationActions: []admissionregistrationv1.ValidationAction{admissionregistrationv1.Deny},
+		},
+	}
+	// Create both the policy and binding in the cluster
+	env.ExpectCreated(admissionspolicy, admissionspolicybinding)
+
+	// Wait for the admission policy to become active
+	// Note: There can be a delay between resource creation and policy enforcement
+	// We use a dry-run nodeclass status update attempt to verify the policy is active
+	nodeClass = env.ExpectReplaceNodeClassCondition(nodeClass, metav1.Condition{
+		Type:               "Ready",
+		Status:             metav1.ConditionFalse,
+		LastTransitionTime: metav1.Now(),
+		ObservedGeneration: nodeClass.GetGeneration(),
+		Reason:             "NotReady",
+		Message:            "NotReady",
+	})
+	By("Validating the admission policy is applied")
+	Eventually(func(g Gomega) {
+		g.Expect(env.Client.Status().Update(env, nodeClass, client.DryRunAll)).ToNot(Succeed())
 	}).Should(Succeed())
 }
 
