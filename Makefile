@@ -7,7 +7,8 @@ HELM_OPTS ?= --set logLevel=debug \
 			--set controller.resources.requests.memory=1Gi \
 			--set controller.resources.limits.cpu=1 \
 			--set controller.resources.limits.memory=1Gi \
-			--set settings.featureGates.nodeRepair=true
+			--set settings.featureGates.nodeRepair=true \
+			--set settings.featureGates.staticCapacity=true
 
 help: ## Display help
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
@@ -41,12 +42,14 @@ apply-with-kind: verify build-with-kind ## Deploy the kwok controller from the c
 		--set-string controller.env[0].name=ENABLE_PROFILING \
 		--set-string controller.env[0].value=true
 
+JUNIT_REPORT := $(if $(ARTIFACT_DIR), --ginkgo.junit-report="$(ARTIFACT_DIR)/junit_report.xml")
 e2etests: ## Run the e2e suite against your local cluster
 	cd test && go test \
 		-count 1 \
 		-timeout 2h \
 		-v \
 		./suites/$(shell echo $(TEST_SUITE) | tr A-Z a-z)/... \
+		$(JUNIT_REPORT) \
 		--ginkgo.focus="${FOCUS}" \
 		--ginkgo.skip="${SKIP}" \
 		--ginkgo.timeout=2h \
