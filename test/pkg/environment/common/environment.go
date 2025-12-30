@@ -46,7 +46,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/operator"
 	"sigs.k8s.io/karpenter/pkg/test"
-	. "sigs.k8s.io/karpenter/pkg/utils/testing" //nolint:stylecheck
+	. "sigs.k8s.io/karpenter/pkg/utils/testing" //nolint:stylecheck,staticcheck
 	"sigs.k8s.io/karpenter/test/pkg/debug"
 )
 
@@ -158,7 +158,7 @@ func NewClient(ctx context.Context, config *rest.Config) client.Client {
 	return c
 }
 
-func (env *Environment) DefaultNodePool(nodeClass client.Object) *v1.NodePool {
+func (env *Environment) DefaultNodePool(nodeClass *unstructured.Unstructured) *v1.NodePool {
 	nodePool := &v1.NodePool{}
 	if lo.FromPtr(nodePoolPath) == "" {
 		nodePool = object.Unmarshal[v1.NodePool](defaultNodePool)
@@ -169,12 +169,13 @@ func (env *Environment) DefaultNodePool(nodeClass client.Object) *v1.NodePool {
 
 	// Update to use the provided default nodeclass
 	nodePool.Spec.Template.Spec.NodeClassRef = &v1.NodeClassReference{
-		Kind:  env.DefaultNodeClass.GetObjectKind().GroupVersionKind().Kind,
-		Group: env.DefaultNodeClass.GetObjectKind().GroupVersionKind().Group,
-		Name:  env.DefaultNodeClass.GetName(),
+		Kind:  nodeClass.GetObjectKind().GroupVersionKind().Kind,
+		Group: nodeClass.GetObjectKind().GroupVersionKind().Group,
+		Name:  nodeClass.GetName(),
 	}
-	nodePool.ObjectMeta.Labels = lo.Assign(nodePool.ObjectMeta.Labels, map[string]string{test.DiscoveryLabel: "unspecified"})
-	nodePool.Spec.Template.ObjectMeta.Labels = lo.Assign(nodePool.Spec.Template.ObjectMeta.Labels, map[string]string{test.DiscoveryLabel: "unspecified"})
+	nodePool.Labels = lo.Assign(nodePool.Labels, map[string]string{test.DiscoveryLabel: "unspecified"})
+	nodePool.Spec.Template.Labels = lo.Assign(nodePool.Spec.Template.Labels, map[string]string{test.DiscoveryLabel: "unspecified"})
+	nodePool.Name = fmt.Sprintf("%s-%s", nodePool.GetName(), test.RandomName())
 	return nodePool
 }
 
