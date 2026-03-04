@@ -50,12 +50,13 @@ func NewExistingNode(n *state.StateNode, topology *Topology, taints []v1.Taint, 
 			daemonResources[k] = v
 		}
 	}
+	available := n.Available()
 	node := &ExistingNode{
 		StateNode:          n,
-		cachedAvailable:    n.Available(),
+		cachedAvailable:    available,
 		cachedTaints:       taints,
 		topology:           topology,
-		remainingResources: resources.Subtract(n.Available(), daemonResources),
+		remainingResources: resources.Subtract(available, daemonResources),
 		requirements:       scheduling.NewLabelRequirements(n.Labels()),
 	}
 	node.requirements.Add(scheduling.NewRequirement(v1.LabelHostname, v1.NodeSelectorOpIn, n.HostName()))
@@ -93,7 +94,16 @@ func (n *ExistingNode) CanAdd(pod *v1.Pod, podData *PodData, volumes scheduling.
 	nodeRequirements := scheduling.NewRequirements(n.requirements.Values()...)
 	nodeRequirements.Add(podData.Requirements.Values()...)
 
+	// Add volume requirements to nodeRequirements ONLY (not to pod's affinity).
+	// This ensures existing node must be in the correct zone for volumes,
+	// while TSC counting uses pod's original affinity.
+	if err := addVolumeRequirements(nodeRequirements, podData.VolumeRequirements); err != nil {
+		return nil, err
+	}
+
 	// Check Topology Requirements
+	// NOTE: podData.StrictRequirements does NOT include volume requirements,
+	// ensuring TSC counting uses pod's original affinity.
 	topologyRequirements, err := n.topology.AddRequirements(pod, n.cachedTaints, podData.StrictRequirements, nodeRequirements)
 	if err != nil {
 		return nil, err

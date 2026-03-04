@@ -68,6 +68,9 @@ func (c CloudProvider) Create(ctx context.Context, nodeClaim *v1.NodeClaim) (*v1
 		}
 		return nil, fmt.Errorf("resolving node class from nodeclaim, %w", err)
 	}
+	if status := nodeClass.StatusConditions().Get(status.ConditionReady); status.IsFalse() {
+		return nil, cloudprovider.NewNodeClassNotReadyError(stderrors.New(status.Message))
+	}
 	// Kick-off a goroutine to allow us to asynchronously register nodes
 	// We're fine to leak this because failed registration can also happen in real providers
 	go func() {
@@ -78,10 +81,6 @@ func (c CloudProvider) Create(ctx context.Context, nodeClaim *v1.NodeClaim) (*v1
 			log.FromContext(ctx).Error(err, "failed creating node from nodeclaim")
 		}
 	}()
-	nodeClassReady := nodeClass.StatusConditions().Get(status.ConditionReady)
-	if nodeClassReady.IsFalse() {
-		return nil, cloudprovider.NewNodeClassNotReadyError(stderrors.New(nodeClassReady.Message))
-	}
 	// convert the node back into a node claim to get the chosen resolved requirement values.
 	return c.toNodeClaim(node)
 }
@@ -105,7 +104,7 @@ func (c CloudProvider) Delete(ctx context.Context, nodeClaim *v1.NodeClaim) erro
 }
 
 func (c CloudProvider) Get(ctx context.Context, providerID string) (*v1.NodeClaim, error) {
-	nodeName := strings.Replace(providerID, kwokProviderPrefix, "", -1)
+	nodeName := strings.ReplaceAll(providerID, kwokProviderPrefix, "")
 	node := &corev1.Node{}
 	if err := c.kubeClient.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
 		if errors.IsNotFound(err) {
@@ -184,7 +183,7 @@ func (c CloudProvider) getInstanceType(instanceTypeName string) (*cloudprovider.
 }
 
 func (c CloudProvider) toNode(nodeClaim *v1.NodeClaim) (*corev1.Node, error) {
-	newName := strings.Replace(namesgenerator.GetRandomName(0), "_", "-", -1)
+	newName := strings.ReplaceAll(namesgenerator.GetRandomName(0), "_", "-")
 	//nolint
 	newName = fmt.Sprintf("%s-%d", newName, rand.Uint32())
 
@@ -226,8 +225,11 @@ func (c CloudProvider) toNode(nodeClaim *v1.NodeClaim) (*corev1.Node, error) {
 			Taints:     []corev1.Taint{v1.UnregisteredNoExecuteTaint},
 		},
 		Status: corev1.NodeStatus{
-			Capacity:    instanceType.Capacity,
-			Allocatable: instanceType.Allocatable(),
+			// KWOK nodes don't support overriding Karpenter's WellKnownResources,
+			// so we only apply resource requests, since NodeOverlay will not apply.
+			// If this changes in the future, we'll need to update capacity and allocatable values for KWOK nodes.
+			Capacity:    nodeClaim.Spec.Resources.Requests,
+			Allocatable: lo.Assign(nodeClaim.Spec.Resources.Requests, instanceType.Allocatable()),
 			Phase:       corev1.NodePending,
 		},
 	}, nil
