@@ -99,8 +99,8 @@ var _ = Describe("Expiration", func() {
 			ExpectNotFound(ctx, env.Client, nodeClaim)
 
 			ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 1, map[string]string{
-				metrics.ReasonLabel: metrics.ExpiredReason,
-				"nodepool":          nodePool.Name,
+				metrics.ReasonLabel:   metrics.ExpiredReason,
+				metrics.NodePoolLabel: nodePool.Name,
 			})
 		})
 		It("should fire a karpenter_nodeclaims_disrupted_total metric when expired", func() {
@@ -113,8 +113,8 @@ var _ = Describe("Expiration", func() {
 
 			ExpectNotFound(ctx, env.Client, nodeClaim)
 			ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 1, map[string]string{
-				metrics.ReasonLabel: metrics.ExpiredReason,
-				"nodepool":          nodePool.Name,
+				metrics.ReasonLabel:   metrics.ExpiredReason,
+				metrics.NodePoolLabel: nodePool.Name,
 			})
 		})
 	})
@@ -173,13 +173,13 @@ var _ = Describe("Expiration", func() {
 		nodeClaim.Spec.ExpireAfter = v1.MustParseNillableDuration("200s")
 		ExpectApplied(ctx, env.Client, nodeClaim, node)
 
-		fakeClock.SetTime(nodeClaim.CreationTimestamp.Time.Add(time.Second * 100))
+		fakeClock.SetTime(nodeClaim.CreationTimestamp.Add(time.Second * 100))
 
 		result := ExpectObjectReconciled(ctx, env.Client, expirationController, nodeClaim)
 		Expect(result.RequeueAfter).To(BeNumerically("~", time.Second*100, time.Second))
 	})
 	It("shouldn't expire the same NodeClaim multiple times", func() {
-		nodeClaim.ObjectMeta.Finalizers = append(nodeClaim.ObjectMeta.Finalizers, "test-finalizer")
+		nodeClaim.Finalizers = append(nodeClaim.Finalizers, "test-finalizer")
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim)
 
 		// step forward to make the node expired
@@ -187,13 +187,13 @@ var _ = Describe("Expiration", func() {
 		ExpectObjectReconciled(ctx, env.Client, expirationController, nodeClaim)
 		ExpectExists(ctx, env.Client, nodeClaim)
 		ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 1, map[string]string{
-			metrics.ReasonLabel: metrics.ExpiredReason,
-			"nodepool":          nodePool.Name,
+			metrics.ReasonLabel:   metrics.ExpiredReason,
+			metrics.NodePoolLabel: nodePool.Name,
 		})
 		ExpectObjectReconciled(ctx, env.Client, expirationController, nodeClaim)
 		ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 1, map[string]string{
-			metrics.ReasonLabel: metrics.ExpiredReason,
-			"nodepool":          nodePool.Name,
+			metrics.ReasonLabel:   metrics.ExpiredReason,
+			metrics.NodePoolLabel: nodePool.Name,
 		})
 	})
 })

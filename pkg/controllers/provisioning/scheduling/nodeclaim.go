@@ -23,6 +23,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/awslabs/operatorpkg/option"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -111,7 +112,7 @@ func NewNodeClaim(
 // CanAdd returns whether the pod can be added to the NodeClaim
 // based on the taints/tolerations, host port compatibility,
 // requirements, resources, reserved capacity reservations, and topology requirements
-func (n *NodeClaim) CanAdd(ctx context.Context, pod *corev1.Pod, podData *PodData) (updatedRequirements scheduling.Requirements, updatedInstanceTypes []*cloudprovider.InstanceType, offeringsToReserve []*cloudprovider.Offering, err error) {
+func (n *NodeClaim) CanAdd(ctx context.Context, pod *corev1.Pod, podData *PodData, relaxMinValues bool) (updatedRequirements scheduling.Requirements, updatedInstanceTypes []*cloudprovider.InstanceType, offeringsToReserve []*cloudprovider.Offering, err error) {
 	// Check Taints
 	if err := scheduling.Taints(n.Spec.Taints).ToleratesPod(pod); err != nil {
 		return nil, nil, nil, err
@@ -130,8 +131,17 @@ func (n *NodeClaim) CanAdd(ctx context.Context, pod *corev1.Pod, podData *PodDat
 	}
 	nodeClaimRequirements.Add(podData.Requirements.Values()...)
 
+	// Add volume requirements to nodeClaimRequirements ONLY (not to pod's affinity).
+	// This ensures NodeClaim is created in the correct zone for volumes,
+	// while TSC counting uses pod's original affinity.
+	if err := addVolumeRequirements(nodeClaimRequirements, podData.VolumeRequirements, scheduling.AllowUndefinedWellKnownLabels); err != nil {
+		return nil, nil, nil, err
+	}
+
 	// Check Topology Requirements
-	topologyRequirements, err := n.topology.AddRequirements(pod, n.NodeClaimTemplate.Spec.Taints, podData.StrictRequirements, nodeClaimRequirements, scheduling.AllowUndefinedWellKnownLabels)
+	// NOTE: podData.StrictRequirements does NOT include volume requirements,
+	// ensuring TSC counting uses pod's original affinity.
+	topologyRequirements, err := n.topology.AddRequirements(pod, n.Spec.Taints, podData.StrictRequirements, nodeClaimRequirements, scheduling.AllowUndefinedWellKnownLabels)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -143,7 +153,13 @@ func (n *NodeClaim) CanAdd(ctx context.Context, pod *corev1.Pod, podData *PodDat
 	// Check instance type combinations
 	requests := resources.Merge(n.Spec.Resources.Requests, podData.Requests)
 
-	remaining, err := filterInstanceTypesByRequirements(n.InstanceTypeOptions, nodeClaimRequirements, podData.Requests, n.daemonResources, requests)
+	remaining, unsatisfiableKeys, err := filterInstanceTypesByRequirements(n.InstanceTypeOptions, nodeClaimRequirements, podData.Requests, n.daemonResources, requests, relaxMinValues)
+	if relaxMinValues {
+		// Update min values on the requirements if they are relaxed
+		for key, minValues := range unsatisfiableKeys {
+			nodeClaimRequirements.Get(key).MinValues = lo.ToPtr(minValues)
+		}
+	}
 	if err != nil {
 		// We avoid wrapping this err because calling String() on InstanceTypeFilterError is an expensive operation
 		// due to calls to resources.Merge and stringifying the nodeClaimRequirements
@@ -166,7 +182,7 @@ func (n *NodeClaim) Add(pod *corev1.Pod, podData *PodData, nodeClaimRequirements
 	n.Spec.Resources.Requests = resources.Merge(n.Spec.Resources.Requests, podData.Requests)
 	n.Requirements = nodeClaimRequirements
 	n.topology.Register(corev1.LabelHostname, n.hostname)
-	n.topology.Record(pod, n.NodeClaim.Spec.Taints, nodeClaimRequirements, scheduling.AllowUndefinedWellKnownLabels)
+	n.topology.Record(pod, n.Spec.Taints, nodeClaimRequirements, scheduling.AllowUndefinedWellKnownLabels)
 	n.hostPortUsage.Add(pod, scheduling.GetHostPorts(pod))
 	n.reservationManager.Reserve(n.hostname, offeringsToReserve...)
 	n.releaseReservedOfferings(n.reservedOfferings, offeringsToReserve)
@@ -266,7 +282,7 @@ func (n *NodeClaim) RemoveInstanceTypeOptionsByPriceAndMinValues(reqs scheduling
 		launchPrice := it.Offerings.Available().WorstLaunchPrice(reqs)
 		return launchPrice < maxPrice
 	})
-	if _, err := n.InstanceTypeOptions.SatisfiesMinValues(reqs); err != nil {
+	if _, _, err := n.InstanceTypeOptions.SatisfiesMinValues(reqs); err != nil {
 		return nil, err
 	}
 	return n, nil
@@ -364,7 +380,8 @@ func (e InstanceTypeFilterError) Error() string {
 }
 
 //nolint:gocyclo
-func filterInstanceTypesByRequirements(instanceTypes []*cloudprovider.InstanceType, requirements scheduling.Requirements, podRequests, daemonRequests, totalRequests corev1.ResourceList) (cloudprovider.InstanceTypes, error) {
+func filterInstanceTypesByRequirements(instanceTypes []*cloudprovider.InstanceType, requirements scheduling.Requirements, podRequests, daemonRequests, totalRequests corev1.ResourceList, relaxMinValues bool) (cloudprovider.InstanceTypes, map[string]int, error) {
+	unsatisfiableKeys := map[string]int{}
 	// We hold the results of our scheduling simulation inside of this InstanceTypeFilterError struct
 	// to reduce the CPU load of having to generate the error string for a failed scheduling simulation
 	err := InstanceTypeFilterError{
@@ -417,16 +434,20 @@ func filterInstanceTypesByRequirements(instanceTypes []*cloudprovider.InstanceTy
 
 	if requirements.HasMinValues() {
 		// We don't care about the minimum number of instance types that meet our requirements here, we only care if they meet our requirements.
-		_, err.minValuesIncompatibleErr = remaining.SatisfiesMinValues(requirements)
+		_, unsatisfiableKeys, err.minValuesIncompatibleErr = remaining.SatisfiesMinValues(requirements)
 		if err.minValuesIncompatibleErr != nil {
-			// If minValues is NOT met for any of the requirement across InstanceTypes, then return empty InstanceTypeOptions as we cannot launch with the remaining InstanceTypes.
-			remaining = nil
+			if !relaxMinValues {
+				// If MinValuesPolicy is set to Strict, return empty InstanceTypeOptions as we cannot launch with the remaining InstanceTypes when min values is violated.
+				remaining = nil
+			} else {
+				err.minValuesIncompatibleErr = nil
+			}
 		}
 	}
 	if len(remaining) == 0 {
-		return nil, err
+		return nil, unsatisfiableKeys, err
 	}
-	return remaining, nil
+	return remaining, unsatisfiableKeys, nil
 }
 
 func compatible(instanceType *cloudprovider.InstanceType, requirements scheduling.Requirements) bool {
@@ -435,4 +456,17 @@ func compatible(instanceType *cloudprovider.InstanceType, requirements schedulin
 
 func fits(instanceType *cloudprovider.InstanceType, requests corev1.ResourceList) bool {
 	return resources.Fits(requests, instanceType.Allocatable())
+}
+
+// addVolumeRequirements adds volume topology requirements to nodeRequirements after checking compatibility.
+// This catches cases like a PV with hostname affinity to a specific node that conflicts with the NodeClaim.
+func addVolumeRequirements(nodeRequirements scheduling.Requirements, volumeRequirements scheduling.Requirements, opts ...option.Function[scheduling.CompatibilityOptions]) error {
+	if len(volumeRequirements) == 0 {
+		return nil
+	}
+	if err := nodeRequirements.Compatible(volumeRequirements, opts...); err != nil {
+		return fmt.Errorf("incompatible volume requirements, %w", err)
+	}
+	nodeRequirements.Add(volumeRequirements.Values()...)
+	return nil
 }

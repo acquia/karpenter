@@ -17,15 +17,22 @@ limitations under the License.
 package common
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"io"
 	"math"
+	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/awslabs/operatorpkg/status"
+	"k8s.io/client-go/transport/spdy"
+
+	"github.com/awslabs/operatorpkg/object"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
@@ -39,7 +46,9 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/tools/portforward"
 	"k8s.io/client-go/transport"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
@@ -115,29 +124,34 @@ func (env *Environment) ExpectStatusUpdated(objects ...client.Object) {
 	}
 }
 
-func (env *Environment) ExpectNodeClassCondition(nodeclass *unstructured.Unstructured, conditions []status.Condition) client.Object {
+func (env *Environment) ExpectReplaceNodeClassCondition(nodeclass *unstructured.Unstructured, condition metav1.Condition) *unstructured.Unstructured {
 	result := nodeclass.DeepCopy()
+	updateStatusCondition := []metav1.Condition{condition}
 
-	err := unstructured.SetNestedSlice(result.Object, lo.Map(conditions, func(condition status.Condition, _ int) interface{} {
+	tt, _, _ := unstructured.NestedSlice(result.Object, "status", "conditions")
+	for _, t := range tt {
+		cond := t.(map[string]interface{})
+		if cond["type"].(string) == condition.Type {
+			continue
+		}
+		updateStatusCondition = append(updateStatusCondition, metav1.Condition{
+			Type:               cond["type"].(string),
+			Status:             metav1.ConditionStatus(cond["status"].(string)),
+			LastTransitionTime: metav1.Unix(lo.Must(time.Parse(time.RFC3339, cond["lastTransitionTime"].(string))).Unix(), 0),
+			Reason:             cond["reason"].(string),
+			Message:            cond["message"].(string),
+			ObservedGeneration: cond["observedGeneration"].(int64),
+		})
+	}
+
+	err := unstructured.SetNestedSlice(result.Object, lo.Map(updateStatusCondition, func(condition metav1.Condition, _ int) interface{} {
 		b := map[string]interface{}{}
-		if condition.Type != "" {
-			b["type"] = condition.Type
-		}
-		if condition.Reason != "" {
-			b["reason"] = condition.Reason
-		}
-		if condition.Status != "" {
-			b["status"] = string(condition.Status)
-		}
-		if condition.Message != "" {
-			b["message"] = condition.Message
-		}
-		if !condition.LastTransitionTime.IsZero() {
-			b["lastTransitionTime"] = condition.LastTransitionTime.Format(time.RFC3339)
-		}
-		if condition.ObservedGeneration != 0 {
-			b["observedGeneration"] = condition.ObservedGeneration
-		}
+		b["type"] = condition.Type
+		b["reason"] = condition.Reason
+		b["status"] = string(condition.Status)
+		b["message"] = condition.Message
+		b["lastTransitionTime"] = condition.LastTransitionTime.Format(time.RFC3339)
+		b["observedGeneration"] = condition.ObservedGeneration
 		return b
 	}), "status", "conditions")
 	Expect(err).To(BeNil())
@@ -931,6 +945,94 @@ func (env *Environment) ExpectBlockNodeRegistration() {
 	}).Should(Succeed())
 }
 
+// ExpectBlockNodeClassStatus sets up a nodeclass status update blocking mechanism using ValidatingAdmissionPolicy.
+// It creates a policy that prevents nodeclassess from updating their status
+//
+// The function performs the following steps:
+// 1. Verifies the cluster version is 1.28 or higher (requirement for ValidatingAdmissionPolicy)
+// 2. Creates an admission policy that specifically targets nodeclass status updates
+// 3. Creates a binding for the admission policy to enforce the validation
+//
+// Note: Requires Kubernetes version 1.28+ to function properly.
+func (env *Environment) ExpectBlockNodeClassStatus(nodeClass *unstructured.Unstructured) {
+	GinkgoHelper()
+
+	version, err := env.KubeClient.Discovery().ServerVersion()
+	Expect(err).To(BeNil())
+	if version.Minor < "28" {
+		Skip("This test is only valid for K8s >= 1.28")
+	}
+
+	// Define the ValidatingAdmissionPolicy that will inspect node creation requests
+	// The policy's validation expression checks if the 'registration' label equals 'fail'
+	admissionspolicy := &admissionregistrationv1.ValidatingAdmissionPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "admission-policy",
+			Labels: map[string]string{
+				test.DiscoveryLabel: "unspecified",
+			},
+		},
+		Spec: admissionregistrationv1.ValidatingAdmissionPolicySpec{
+			FailurePolicy: lo.ToPtr(admissionregistrationv1.Fail),
+			MatchConstraints: &admissionregistrationv1.MatchResources{
+				ResourceRules: []admissionregistrationv1.NamedRuleWithOperations{
+					{
+						RuleWithOperations: admissionregistrationv1.RuleWithOperations{
+							Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Update},
+							Rule: admissionregistrationv1.Rule{
+								APIGroups:   []string{object.GVK(nodeClass).Group},
+								APIVersions: []string{object.GVK(nodeClass).Version},
+								Resources:   []string{strings.ToLower(object.GVK(nodeClass).Kind) + "es/status"},
+							},
+						},
+					},
+				},
+			},
+			Validations: []admissionregistrationv1.Validation{
+				{
+					// Blocks status condition updates that lack the 'TestingNotReady' reason field.
+					// This prevents the Karpenter controller from modifying status conditions
+					// while allowing our test suite to make updates. This provides a deterministic
+					// mechanism for E2E tests to update NodeClass conditions.
+					Expression: "object.status.conditions.filter(c, c.type == 'Ready').all(c, c.reason == 'TestingNotReady')",
+				},
+			},
+		},
+	}
+
+	// Create the binding that connects the admission policy to the cluster's admission chain
+	admissionspolicybinding := &admissionregistrationv1.ValidatingAdmissionPolicyBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "admission-policy-binding",
+			Labels: map[string]string{
+				test.DiscoveryLabel: "unspecified",
+			},
+		},
+		Spec: admissionregistrationv1.ValidatingAdmissionPolicyBindingSpec{
+			PolicyName:        admissionspolicy.Name,
+			ValidationActions: []admissionregistrationv1.ValidationAction{admissionregistrationv1.Deny},
+		},
+	}
+	// Create both the policy and binding in the cluster
+	env.ExpectCreated(admissionspolicy, admissionspolicybinding)
+
+	// Wait for the admission policy to become active
+	// Note: There can be a delay between resource creation and policy enforcement
+	// We use a dry-run nodeclass status update attempt to verify the policy is active
+	nodeClass = env.ExpectReplaceNodeClassCondition(nodeClass, metav1.Condition{
+		Type:               "Ready",
+		Status:             metav1.ConditionFalse,
+		LastTransitionTime: metav1.Now(),
+		ObservedGeneration: nodeClass.GetGeneration(),
+		Reason:             "NotReady",
+		Message:            "NotReady",
+	})
+	By("Validating the admission policy is applied")
+	Eventually(func(g Gomega) {
+		g.Expect(env.Client.Status().Update(env, nodeClass, client.DryRunAll)).ToNot(Succeed())
+	}).Should(Succeed())
+}
+
 func (env *Environment) ConsistentlyExpectNodeClaimsNotDrifted(duration time.Duration, nodeClaims ...*v1.NodeClaim) {
 	GinkgoHelper()
 	nodeClaimNames := lo.Map(nodeClaims, func(nc *v1.NodeClaim, _ int) string { return nc.Name })
@@ -940,6 +1042,17 @@ func (env *Environment) ConsistentlyExpectNodeClaimsNotDrifted(duration time.Dur
 			g.Expect(env.Client.Get(env, client.ObjectKeyFromObject(nc), nc)).To(Succeed())
 			g.Expect(nc.StatusConditions().Get(v1.ConditionTypeDrifted)).To(BeNil())
 		}
+	}, duration).Should(Succeed())
+}
+
+func (env *Environment) ConsistentlyExpectNodeClaimCountNotExceed(duration time.Duration, count int) {
+	GinkgoHelper()
+	By(fmt.Sprintf("consistently expect NodeClaim count to not exceed %d for %s", count, duration))
+
+	Consistently(func(g Gomega) {
+		nodeClaimList := &v1.NodeClaimList{}
+		g.Expect(env.Client.List(env, nodeClaimList)).To(Succeed())
+		g.Expect(len(nodeClaimList.Items)).To(BeNumerically("<=", count))
 	}, duration).Should(Succeed())
 }
 
@@ -1157,4 +1270,108 @@ func (env *Environment) GetDaemonSetOverhead(np *v1.NodePool) corev1.ResourceLis
 		}
 		return p, true
 	})...)
+}
+
+type PrometheusMetric struct {
+	Name   string
+	Labels map[string]string
+	Value  float64
+}
+
+func (env *Environment) ExpectPodMetrics() (res []PrometheusMetric) {
+	GinkgoHelper()
+
+	ctx, cancel := context.WithCancel(env.Context)
+	defer cancel()
+
+	localPort := rand.IntnRange(1025, 49151)
+	env.ExpectPodPortForwarded(ctx, env.ExpectActiveKarpenterPod(), 8080, localPort)
+
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", localPort))
+	Expect(err).ToNot(HaveOccurred())
+	reader := bufio.NewReader(resp.Body)
+	defer resp.Body.Close()
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			//nolint:errorlint
+			if err == io.EOF {
+				break
+			}
+			continue
+		}
+		metric, err := parseMetricsLine(string(line))
+		if err != nil {
+			continue
+		}
+		res = append(res, metric)
+	}
+	return res
+}
+
+var (
+	prometheusMetricRegex = regexp.MustCompile(`(?P<Name>.*){(?P<Labels>.*)} (?P<Value>\d*(?:\.\d*)?)`)
+)
+
+func parseMetricsLine(line string) (metric PrometheusMetric, err error) {
+	groups := prometheusMetricRegex.FindStringSubmatch(line)
+	if len(groups) != 4 {
+		return PrometheusMetric{}, fmt.Errorf("metrics line doesn't match known prometheus syntax")
+	}
+
+	elems := strings.Split(groups[2], ",")
+	l := lo.SliceToMap(elems, func(elem string) (string, string) {
+		temp := strings.Split(elem, "=")
+		k, v := temp[0], temp[1]
+		return k, strings.Trim(v, "\"")
+	})
+	v, err := strconv.ParseFloat(groups[3], 64)
+	if err != nil {
+		return PrometheusMetric{}, fmt.Errorf("converting metrics value to an integer, %w", err)
+	}
+	return PrometheusMetric{Name: groups[1], Labels: l, Value: v}, nil
+}
+
+func (env *Environment) ExpectPodPortForwarded(ctx context.Context, pod *corev1.Pod, podPort, localPort int) {
+	GinkgoHelper()
+
+	roundTripper, upgrader, err := spdy.RoundTripperFor(env.Config)
+	Expect(err).ToNot(HaveOccurred())
+
+	serverURL := env.KubeClient.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Namespace(pod.Namespace).
+		Name(pod.Name).
+		SubResource("portforward").URL()
+
+	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: roundTripper}, http.MethodPost, serverURL)
+
+	ready := make(chan struct{})
+	stop := make(chan struct{})
+	go func() {
+		GinkgoRecover()
+		<-ctx.Done()
+		close(stop)
+	}()
+	go func() {
+		fw, err := portforward.New(dialer, []string{fmt.Sprintf("%d:%d", localPort, podPort)}, stop, ready, io.Discard, io.Discard)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(fw.ForwardPorts())
+	}()
+	<-ready
+}
+
+func (env *Environment) GetNodePoolCost(nodePoolName string) float64 {
+	GinkgoHelper()
+	var cost float64
+	Eventually(func(g Gomega) {
+		defer GinkgoRecover()
+		podMetrics := env.ExpectPodMetrics()
+		priceMetrics := lo.Filter(podMetrics, func(p PrometheusMetric, _ int) bool {
+			return p.Name == "karpenter_nodepools_cost_total" && p.Labels["nodepool"] == nodePoolName
+		})
+		g.Expect(priceMetrics).ToNot(BeEmpty())
+		cost = priceMetrics[0].Value
+	}, 2*time.Minute, time.Second*5).Should(Succeed())
+	return cost
 }

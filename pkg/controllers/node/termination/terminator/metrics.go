@@ -31,13 +31,13 @@ const (
 	ReasonLabel = "reason"
 )
 
-var NodesEvictionRequestsTotal = opmetrics.NewPrometheusCounter(
+var PodsEvictionRequestsTotal = opmetrics.NewPrometheusCounter(
 	crmetrics.Registry,
 	prometheus.CounterOpts{
 		Namespace: metrics.Namespace,
-		Subsystem: metrics.NodeSubsystem,
+		Subsystem: metrics.PodSubsystem,
 		Name:      "eviction_requests_total",
-		Help:      "The total number of eviction requests made by Karpenter",
+		Help:      "The total number of pod eviction requests made by Karpenter, labeled by response code",
 	},
 	[]string{CodeLabel},
 )
@@ -47,7 +47,7 @@ var PodsDrainedTotal = opmetrics.NewPrometheusCounter(
 	prometheus.CounterOpts{
 		Namespace: metrics.Namespace,
 		Subsystem: metrics.PodSubsystem,
-		Name:      "pods_drained_total",
+		Name:      "drained_total",
 		Help:      "The total number of pods drained during node termination by Karpenter, labeled by reason",
 	},
 	[]string{ReasonLabel},
